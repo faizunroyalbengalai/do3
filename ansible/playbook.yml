@@ -1,0 +1,252 @@
+---
+# Thin Ansible orchestrator for DigitalOcean Droplet.
+# When registry is set ("ghcr" or "docr") the playbook installs Docker and
+# pulls a pre-built container from that registry. Otherwise it installs the
+# language runtime natively and runs the app under systemd/pm2.
+- name: Deploy do3
+  hosts: all
+  become: true
+  gather_facts: yes
+  vars:
+    ansible_ssh_retries: 5
+    app_dir: /opt/app
+    app_port: 8080
+    project: 'do3'
+    web_server: 'nginx'
+    docker_image: '{{ docker_image }}'
+    ghcr_actor: '{{ ghcr_actor }}'
+    ghcr_token: '{{ ghcr_token }}'
+    # Laravel 11 requires PHP >= 8.2.
+    php_version: '8.2'
+
+  tasks:
+    # ── System update ──────────────────────────────────────────────────────────
+    - name: Wait for SSH to be fully ready
+      wait_for_connection:
+        timeout: 120
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      retries: 3
+      delay: 10
+      register: _apt_update
+      until: _apt_update is succeeded
+
+
+    # ── Local database installation ───────────────────────────────────────────
+    - name: Install PostgreSQL server
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: yes
+
+    - name: Ensure PostgreSQL is started
+      systemd:
+        name: postgresql
+        state: started
+        enabled: yes
+
+    - name: Wait for PostgreSQL to be ready
+      wait_for:
+        port: 5432
+        host: 127.0.0.1
+        timeout: 60
+
+    - name: Create PostgreSQL database and user
+      shell: |
+        DB_NAME="{{ deploy_db_name | default(project | replace('-', '_') + 'db', true) }}"
+        DB_USER="{{ deploy_db_username | default('appuser', true) }}"
+        DB_PASS="{{ deploy_db_password | default('apppass', true) }}"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='$DB_NAME'" | grep -q 1 \
+          || sudo -u postgres psql -c "CREATE DATABASE \"$DB_NAME\";"
+        sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname='$DB_USER'" | grep -q 1 \
+          || sudo -u postgres psql -c "CREATE USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
+        sudo -u postgres psql -c "ALTER USER \"$DB_USER\" WITH PASSWORD '$DB_PASS';"
+        sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE \"$DB_NAME\" TO \"$DB_USER\";"
+        sudo -u postgres psql -c "ALTER DATABASE \"$DB_NAME\" OWNER TO \"$DB_USER\";"
+      args:
+        executable: /bin/bash
+
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+        update_cache: yes
+
+    - name: Configure Nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/app
+        content: |
+          server {
+            listen 80;
+            server_name _;
+            location / {
+              proxy_pass http://127.0.0.1:{{ app_port }};
+              proxy_set_header Host $host;
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+              proxy_read_timeout 120s;
+            }
+          }
+
+    - name: Enable Nginx site
+      file:
+        src: /etc/nginx/sites-available/app
+        dest: /etc/nginx/sites-enabled/app
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+
+    - name: Create app directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        mode: '0755'
+
+    # ── Docker (GHCR) ─────────────────────────────────────────────────────────
+    - name: Install Docker
+      shell: |
+        curl -fsSL https://get.docker.com | sh
+      args:
+        executable: /bin/bash
+        creates: /usr/bin/docker
+
+    - name: Login to GHCR
+      shell: |
+        echo "{{ ghcr_token }}" | docker login ghcr.io -u "{{ ghcr_actor }}" --password-stdin
+      args:
+        executable: /bin/bash
+      no_log: true
+
+    - name: Pull image from GHCR
+      shell: docker pull "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+
+    # Resolve DB connection details for generic runtimes (Node / Python / PHP /
+    # Go / Ruby / Rust). The deploy.yml workflow passes deploy_database_url
+    # (already in scheme://user:pass@host:port/db form), and individual
+    # deploy_db_* fields, via --extra-vars. We extract host/port here so apps
+    # that prefer split env vars (DB_HOST/DB_PORT) get them populated too.
+    #
+    # We do NOT use lookup('env', ...) here — that returned empty in this
+    # pipeline's Ansible invocation, which is what produced the Python 502
+    # (container started but DATABASE_URL was blank, app couldn't reach RDS).
+    - name: Parse DATABASE_URL into host/port for split env vars
+      shell: |
+        set -e
+        DB_URL_RAW="{{ deploy_database_url | default('', true) }}"
+        DB_HOST=""
+        DB_PORT=""
+        if [ -n "$DB_URL_RAW" ]; then
+          REST="$(echo "$DB_URL_RAW" | sed -E 's|^[a-z]+://([^/]+)/?.*|\1|')"
+          HOSTPORT="$(echo "$REST" | sed -E 's|^[^@]*@||')"
+          DB_HOST="$(echo "$HOSTPORT" | sed -E 's|:.*$||')"
+          DB_PORT="$(echo "$HOSTPORT" | sed -E 's|^[^:]+:?||')"
+        fi
+        printf '{"db_host":"%s","db_port":"%s"}\n' "$DB_HOST" "$DB_PORT"
+      args:
+        executable: /bin/bash
+      register: _generic_db_parse
+      changed_when: false
+
+    - name: Store DB host/port facts
+      set_fact:
+        generic_db_host: "{{ (_generic_db_parse.stdout | from_json).db_host }}"
+        generic_db_port: "{{ (_generic_db_parse.stdout | from_json).db_port }}"
+
+    # Laravel refuses to boot without APP_KEY (throws "No application encryption
+    # key has been specified"). Generate one once per droplet and persist it so
+    # subsequent deploys reuse the same key (otherwise existing encrypted
+    # sessions / queues / cache become unreadable).
+    - name: Generate Laravel APP_KEY (one-shot, persistent)
+      shell: |
+        if [ ! -f /opt/laravel_app_key ]; then
+          KEY="base64:$(openssl rand -base64 32)"
+          echo "$KEY" > /opt/laravel_app_key
+          chmod 600 /opt/laravel_app_key
+        fi
+        cat /opt/laravel_app_key
+      args:
+        executable: /bin/bash
+      register: laravel_app_key
+      changed_when: false
+      no_log: true
+
+    # Build the docker run env-var list. We use --env-file pointed at a file
+    # we generate just-in-time so passwords never appear on the command line
+    # (which would land in /var/log + `docker inspect`).
+    - name: Write docker env file
+      copy:
+        dest: "/opt/app.env"
+        mode: '0600'
+        content: |
+          PORT={{ app_port }}
+          # Generic env vars consumed by Node / Python / PHP / Go / Ruby / Rust apps.
+          # Source: deploy_*  Ansible vars (passed via --extra-vars from the
+          # configure job), NOT lookup('env', ...) — see comment above.
+          DATABASE_URL={{ deploy_database_url | default('', true) }}
+          DB_HOST={{ generic_db_host | default('', true) }}
+          DB_PORT={{ generic_db_port | default('', true) }}
+          DB_NAME={{ deploy_db_name | default('', true) }}
+          DB_USERNAME={{ deploy_db_username | default('', true) }}
+          DB_PASSWORD={{ deploy_db_password | default('', true) }}
+          NODE_ENV=production
+          APP_ENV=production
+          # Laravel-specific: APP_KEY is mandatory; map DB vars to Laravel's
+          # naming (DB_CONNECTION + DB_DATABASE) so config/database.php picks
+          # them up without us having to ship a .env into the image.
+          APP_KEY={{ laravel_app_key.stdout | default('', true) }}
+          APP_DEBUG=false
+          APP_URL=http://{{ ansible_host | default(inventory_hostname) }}
+          LOG_CHANNEL=stderr
+          LOG_LEVEL=info
+          CACHE_DRIVER=file
+          SESSION_DRIVER=file
+          QUEUE_CONNECTION=sync
+          DB_CONNECTION={{ 'pgsql' if deploy_db_type in ('postgres', 'postgresql') else (deploy_db_type | default('mysql', true)) }}
+          DB_DATABASE={{ deploy_db_name | default('', true) }}
+          # When install_db=local, no DATABASE_URL is passed, so the parser
+          # leaves host/port blank. Override here so Laravel can reach the
+          # postgres/mysql running on the host (container uses --network host
+          # so 127.0.0.1 = the host's loopback).
+          DB_HOST={{ generic_db_host if generic_db_host else '127.0.0.1' }}
+          DB_PORT={{ generic_db_port if generic_db_port else ('5432' if deploy_db_type in ('postgres', 'postgresql') else '3306') }}
+      no_log: true
+
+    - name: Run container
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d \
+          --name {{ project }} \
+          --restart always \
+          --network host \
+          --env-file /opt/app.env \
+          "{{ docker_image }}"
+      args:
+        executable: /bin/bash
+
+    - name: Reload and start web server
+      service:
+        name: "{{ 'apache2' if (web_server or 'nginx').lower() == 'apache' else 'nginx' }}"
+        state: reloaded
+        enabled: yes
+
+  handlers:
+    - name: Restart app
+      shell: |
+        docker rm -f {{ project }} 2>/dev/null || true
+        docker run -d --name {{ project }} --restart always --network host \
+          --env-file /opt/app.env "{{ docker_image }}"
+      args:
+        executable: /bin/bash

@@ -1,0 +1,221 @@
+name: Deploy — do3
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+  build_push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set image tag
+        id: meta
+        run: echo "image=ghcr.io/${{ github.repository_owner }}/do3:${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  provision:
+    name: Provision Droplet (Terraform)
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      server_ip: ${{ steps.get_ip.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_SPACE }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate" \
+            -backend-config="region=${{ secrets.DO_REGION }}" \
+            -backend-config="access_key=${{ secrets.SPACES_ACCESS_KEY }}" \
+            -backend-config="secret_key=${{ secrets.SPACES_SECRET_KEY }}" \
+            -backend-config="skip_requesting_account_id=true"
+      - name: Reconcile existing SSH key
+        working-directory: terraform
+        run: |
+          KEY_NAME="udap-${{ secrets.PROJECT_NAME }}"
+          RESP=$(curl -sf -X GET "https://api.digitalocean.com/v2/account/keys" \
+            -H "Authorization: Bearer ${{ secrets.DO_TOKEN }}" || true)
+          KEY_ID=$(echo "$RESP" | python3 -c "
+          import sys,json
+          keys=json.load(sys.stdin).get('ssh_keys',[])
+          match=[k for k in keys if k['name']=='$KEY_NAME']
+          print(match[0]['id'] if match else '')
+          " 2>/dev/null || true)
+          KEY_FP=$(echo "$RESP" | python3 -c "
+          import sys,json
+          keys=json.load(sys.stdin).get('ssh_keys',[])
+          match=[k for k in keys if k['name']=='$KEY_NAME']
+          print(match[0]['fingerprint'] if match else '')
+          " 2>/dev/null || true)
+
+          if [ -n "$KEY_ID" ]; then
+            # Compute fingerprint of the current deploy public key
+            EXPECTED_FP=$(echo "${{ secrets.SSH_PUBLIC_KEY }}" | ssh-keygen -l -f - 2>/dev/null | awk '{print $2}' || true)
+            if [ "$KEY_FP" = "$EXPECTED_FP" ]; then
+              echo "SSH key '$KEY_NAME' exists and fingerprint matches — importing"
+              terraform import \
+                -var="do_token=${{ secrets.DO_TOKEN }}" \
+                -var="project_name=${{ secrets.PROJECT_NAME }}" \
+                -var="do_region=${{ secrets.DO_REGION }}" \
+                -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+                digitalocean_ssh_key.deploy "$KEY_ID" || true
+            else
+              echo "SSH key '$KEY_NAME' exists but fingerprint mismatch — deleting stale key (id=$KEY_ID)"
+              curl -sf -X DELETE "https://api.digitalocean.com/v2/account/keys/$KEY_ID" \
+                -H "Authorization: Bearer ${{ secrets.DO_TOKEN }}" || true
+              echo "Stale key deleted — Terraform will create a fresh one"
+            fi
+          fi
+      - name: Terraform plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="do_token=${{ secrets.DO_TOKEN }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="do_region=${{ secrets.DO_REGION }}" \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -out=tfplan
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Get Droplet IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          IP=$(terraform output -raw public_ip)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
+
+  configure:
+    name: Configure & Deploy (Ansible)
+    runs-on: ubuntu-latest
+    needs: [provision, build_push]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write SSH private key
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Install Ansible
+        run: sudo apt-get update -qq && sudo apt-get install -y ansible
+      - name: Wait for SSH
+        run: |
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }} \
+              "cloud-init status --wait 2>/dev/null; echo ok" \
+              && break || sleep 15
+          done
+      - name: Run Ansible playbook
+        working-directory: ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          DEPLOY_DB_NAME:      ${{ secrets.DB_NAME }}
+          DEPLOY_DB_USERNAME:  ${{ secrets.DB_USERNAME }}
+          DEPLOY_DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
+          DEPLOY_DB_TYPE:      ${{ secrets.DB_TYPE }}
+        run: |
+          EXTRA_VARS=()
+          : "${DEPLOY_DB_USERNAME:=appuser}"
+          EXTRA_VARS+=(-e "deploy_db_name=${DEPLOY_DB_NAME}")
+          EXTRA_VARS+=(-e "deploy_db_username=${DEPLOY_DB_USERNAME}")
+          EXTRA_VARS+=(-e "deploy_db_password=${DEPLOY_DB_PASSWORD}")
+          EXTRA_VARS+=(-e "deploy_db_type=${DEPLOY_DB_TYPE}")
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            --timeout 60 \
+            -e docker_image="${{ needs.build_push.outputs.image }}" \
+            -e ghcr_actor="${{ github.actor }}" \
+            -e ghcr_token="${{ secrets.GITHUB_TOKEN }}" \
+            "${EXTRA_VARS[@]}" \
+            playbook.yml
+
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Wait for app to be healthy
+        id: hc
+        run: |
+          echo "Waiting 45s for app startup before polling..."
+          sleep 45
+          HEALTH_PATH="/health"
+          for i in $(seq 1 24); do
+            curl -sf http://${{ needs.provision.outputs.server_ip }}${HEALTH_PATH} && exit 0
+            echo "Attempt $i/24 failed — retrying in 15s"
+            sleep 15
+          done
+          echo "ERROR: ${HEALTH_PATH} returned non-2xx after all retries"
+          exit 1
+      - name: Diagnose failure (SSH into droplet)
+        if: failure()
+        run: |
+          # When /health fails, the most useful output is on the droplet itself.
+          # Print app service status, last 80 lines of its journal, listening
+          # ports, and nginx error log so the cause is visible in this run.
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+          SSH="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }}"
+          echo "::group::systemctl status app"
+          $SSH "systemctl status app --no-pager -l || true"
+          echo "::endgroup::"
+          echo "::group::journalctl -u app (last 80 lines)"
+          $SSH "journalctl -u app -n 80 --no-pager || true"
+          echo "::endgroup::"
+          echo "::group::Listening ports"
+          $SSH "ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null || true"
+          echo "::endgroup::"
+          echo "::group::Docker containers (ps -a)"
+          $SSH "docker ps -a 2>/dev/null || echo 'docker not installed'"
+          echo "::endgroup::"
+          echo "::group::Docker logs for app container (last 100 lines)"
+          $SSH "CID=\$(docker ps -a --filter name=. --format '{{.ID}}' 2>/dev/null | head -n 1); [ -n \"\$CID\" ] && docker logs --tail 100 \$CID 2>&1 || echo 'no app container found'"
+          echo "::endgroup::"
+          echo "::group::Docker inspect (state)"
+          $SSH "CID=\$(docker ps -a --format '{{.ID}}' 2>/dev/null | head -n 1); [ -n \"\$CID\" ] && docker inspect \$CID --format 'Status: {{.State.Status}}, Exit: {{.State.ExitCode}}, Error: {{.State.Error}}, OOMKilled: {{.State.OOMKilled}}, StartedAt: {{.State.StartedAt}}, FinishedAt: {{.State.FinishedAt}}' 2>&1 || echo 'no container'"
+          echo "::endgroup::"
+          echo "::group::nginx error log (last 40 lines)"
+          $SSH "tail -n 40 /var/log/nginx/error.log 2>/dev/null || true"
+          echo "::endgroup::"
+          echo "::group::App .env (keys only, values redacted)"
+          $SSH "[ -f /opt/app/.env ] && sed 's/=.*/=REDACTED/' /opt/app/.env || echo 'no .env file'"
+          echo "::endgroup::"
+          echo "::group::Dockerfile EXPOSE + Apache port config"
+          $SSH "docker images --format '{{.Repository}}:{{.Tag}}' | head -n 5"
+          echo "::endgroup::"
+
